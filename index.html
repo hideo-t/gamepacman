@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mini Pacman (Sound)</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0b0f1a;color:#e8ecff;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans JP",sans-serif}
+    .wrap{max-width:900px;margin:0 auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+    .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+    .left{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    button{background:#1b2550;color:#fff;border:1px solid #2a3a7a;border-radius:10px;padding:8px 12px;cursor:pointer}
+    button:active{transform:translateY(1px)}
+    .hint{opacity:.85;font-size:13px}
+    canvas{background:#060913;border:1px solid #1d2a55;border-radius:14px;display:block;max-width:100%;height:auto}
+    .stats{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+    .pill{padding:6px 10px;border:1px solid #22306a;border-radius:999px;background:#0d1433;font-size:13px}
+    a{color:#93b4ff}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <div class="left">
+        <button id="btnStart">Start / Resume</button>
+        <button id="btnRestart">Restart</button>
+        <button id="btnMute">Sound: ON</button>
+        <span class="hint">Move: Arrow keys / WASD ・ Click Start once to enable audio</span>
+      </div>
+      <div class="stats">
+        <span class="pill">Score: <b id="score">0</b></span>
+        <span class="pill">Dots: <b id="dotsLeft">0</b></span>
+        <span class="pill">Status: <b id="status">READY</b></span>
+      </div>
+    </div>
+
+    <canvas id="c" width="640" height="480"></canvas>
+    <div class="hint">
+      ちょい小技：スマホなら画面タップ→Start押してから、外付けキーボードで操作が安定だよ。
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ===== Canvas & UI =====
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const scoreEl = document.getElementById("score");
+  const dotsEl  = document.getElementById("dotsLeft");
+  const statusEl= document.getElementById("status");
+  const btnStart= document.getElementById("btnStart");
+  const btnRestart = document.getElementById("btnRestart");
+  const btnMute = document.getElementById("btnMute");
+
+  // ===== Audio (WebAudio) =====
+  let audioCtx = null;
+  let muted = false;
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  }
+
+  function beep({freq=440, dur=0.08, type="sine", gain=0.06, slide=0, when=0}={}) {
+    if (muted) return;
+    ensureAudio();
+    const t0 = audioCtx.currentTime + when;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t0);
+    if (slide !== 0) {
+      o.frequency.exponentialRampToValueAtTime(Math.max(20, freq + slide), t0 + dur);
+    }
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t0);
+    o.stop(t0 + dur + 0.02);
+  }
+
+  const sfx = {
+    dot()   { beep({freq: 880, dur: 0.05, type:"square", gain:0.035, slide:-200}); },
+    death() { beep({freq: 220, dur: 0.18, type:"sawtooth", gain:0.08, slide:-120}); beep({freq:140, dur:0.22, type:"triangle", gain:0.06, when:0.08, slide:-60}); },
+    win()   { beep({freq: 523, dur:0.10, type:"triangle", gain:0.06}); beep({freq:659, dur:0.10, type:"triangle", gain:0.06, when:0.11}); beep({freq:784, dur:0.12, type:"triangle", gain:0.07, when:0.22}); }
+  };
+
+  // ===== Game config =====
+  const TILE = 24;
+  const COLS = Math.floor(canvas.width / TILE);
+  const ROWS = Math.floor(canvas.height / TILE);
+
+  // 0 empty, 1 wall, 2 dot
+  let map = [];
+  let dotsLeft = 0;
+  let score = 0;
+
+  const dir = {x:0,y:0};
+  let nextDir = {x:0,y:0};
+
+  const player = {
+    x: 1, y: 1, // tile coords
+    px: 1*TILE + TILE/2, py: 1*TILE + TILE/2, // pixel center
+    speed: 3.0,
+    radius: TILE*0.38,
+    mouth: 0,
+    mouthDir: 1,
+    alive: true
+  };
+
+  const ghost = {
+    x: COLS-2, y: ROWS-2,
+    px: (COLS-2)*TILE + TILE/2, py: (ROWS-2)*TILE + TILE/2,
+    speed: 2.4,
+    radius: TILE*0.36,
+    color: "#ff4d6d"
+  };
+
+  let running = false;
+  let status = "READY"; // READY, RUNNING, WIN, LOSE
+
+  // ===== Map generation (simple maze-ish) =====
+  function genMap() {
+    map = new Array(ROWS).fill(0).map(() => new Array(COLS).fill(0));
+    dotsLeft = 0;
+
+    // Border walls
+    for (let y=0;y<ROWS;y++){
+      for (let x=0;x<COLS;x++){
+        if (x===0 || y===0 || x===COLS-1 || y===ROWS-1) map[y][x] = 1;
+      }
+    }
+
+    // Some inner walls (deterministic pattern)
+    for (let y=2;y<ROWS-2;y++){
+      for (let x=2;x<COLS-2;x++){
+        if ((x%4===0 && y%2===0) || (y%5===0 && x%3===0)) map[y][x] = 1;
+      }
+    }
+
+    // Ensure starting areas are clear
+    const clears = [
+      [1,1],[1,2],[2,1],[2,2],[3,1],
+      [COLS-2,ROWS-2],[COLS-3,ROWS-2],[COLS-2,ROWS-3],[COLS-3,ROWS-3]
+    ];
+    for (const [x,y] of clears) map[y][x] = 0;
+
+    // Place dots everywhere except walls
+    for (let y=1;y<ROWS-1;y++){
+      for (let x=1;x<COLS-1;x++){
+        if (map[y][x] === 0) { map[y][x] = 2; dotsLeft++; }
+      }
+    }
+    // Remove dot at start positions
+    if (map[player.y][player.x] === 2) { map[player.y][player.x] = 0; dotsLeft--; }
+    if (map[ghost.y][ghost.x] === 2) { map[ghost.y][ghost.x] = 0; dotsLeft--; }
+
+    updateHUD();
+  }
+
+  function resetEntities() {
+    player.x=1; player.y=1;
+    player.px=player.x*TILE+TILE/2; player.py=player.y*TILE+TILE/2;
+    dir.x=0; dir.y=0; nextDir={x:0,y:0};
+    player.alive=true;
+    player.mouth=0; player.mouthDir=1;
+
+    ghost.x=COLS-2; ghost.y=ROWS-2;
+    ghost.px=ghost.x*TILE+TILE/2; ghost.py=ghost.y*TILE+TILE/2;
+  }
+
+  function restart() {
+    score=0;
+    status="READY";
+    running=false;
+    statusEl.textContent=status;
+    genMap();
+    resetEntities();
+    draw();
+  }
+
+  // ===== Helpers =====
+  function tileAtPixel(px, py) {
+    const x = Math.floor(px / TILE);
+    const y = Math.floor(py / TILE);
+    return {x, y};
+  }
+
+  function isWallTile(x,y){
+    if (y<0||y>=ROWS||x<0||x>=COLS) return true;
+    return map[y][x] === 1;
+  }
+
+  function canMoveFrom(px, py, dx, dy) {
+    // Check collision by sampling 4 points around circle (player radius)
+    const r = player.radius;
+    const nx = px + dx;
+    const ny = py + dy;
+    const pts = [
+      [nx + r, ny],
+      [nx - r, ny],
+      [nx, ny + r],
+      [nx, ny - r],
+    ];
+    for (const [sx, sy] of pts) {
+      const tx = Math.floor(sx / TILE);
+      const ty = Math.floor(sy / TILE);
+      if (isWallTile(tx, ty)) return false;
+    }
+    return true;
+  }
+
+  function eatDotIfAny() {
+    const t = tileAtPixel(player.px, player.py);
+    if (map[t.y] && map[t.y][t.x] === 2) {
+      map[t.y][t.x] = 0;
+      dotsLeft--;
+      score += 10;
+      sfx.dot();
+      updateHUD();
+      if (dotsLeft <= 0) {
+        status="WIN";
+        running=false;
+        statusEl.textContent=status;
+        sfx.win();
+      }
+    }
+  }
+
+  function updateHUD(){
+    scoreEl.textContent = String(score);
+    dotsEl.textContent = String(dotsLeft);
+  }
+
+  // ===== Input =====
+  const keyToDir = (k) => {
+    const kk = k.toLowerCase();
+    if (kk==="arrowleft" || kk==="a") return {x:-1,y:0};
+    if (kk==="arrowright"|| kk==="d") return {x: 1,y:0};
+    if (kk==="arrowup"   || kk==="w") return {x:0,y:-1};
+    if (kk==="arrowdown" || kk==="s") return {x:0,y: 1};
+    return null;
+  };
+
+  window.addEventListener("keydown", (e) => {
+    const nd = keyToDir(e.key);
+    if (!nd) return;
+    e.preventDefault();
+    nextDir = nd;
+  }, {passive:false});
+
+  // ===== Game loop =====
+  function step() {
+    if (!running) return;
+
+    // Smooth turning: attempt nextDir if possible
+    const pdx = nextDir.x * player.speed;
+    const pdy = nextDir.y * player.speed;
+
+    if ((nextDir.x !== dir.x || nextDir.y !== dir.y) && canMoveFrom(player.px, player.py, pdx, pdy)) {
+      dir.x = nextDir.x;
+      dir.y = nextDir.y;
+    }
+
+    const dx = dir.x * player.speed;
+    const dy = dir.y * player.speed;
+
+    if (canMoveFrom(player.px, player.py, dx, dy)) {
+      player.px += dx;
+      player.py += dy;
+    } else {
+      // stop if hit wall
+      dir.x = 0; dir.y = 0;
+    }
+
+    // Mouth animation
+    player.mouth += 0.10 * player.mouthDir;
+    if (player.mouth > 1) { player.mouth=1; player.mouthDir=-1; }
+    if (player.mouth < 0) { player.mouth=0; player.mouthDir= 1; }
+
+    // Eat dots
+    eatDotIfAny();
+
+    // Ghost chase: simple greedy movement with wall avoidance
+    ghostMove();
+
+    // Check collision
+    const dist2 = (player.px-ghost.px)**2 + (player.py-ghost.py)**2;
+    const rr = (player.radius + ghost.radius) * 0.88;
+    if (dist2 < rr*rr) {
+      status="LOSE";
+      running=false;
+      statusEl.textContent=status;
+      sfx.death();
+      // quick reset after a beat
+      setTimeout(() => {
+        if (status === "LOSE") {
+          // keep score? simplest: restart stage
+          restart();
+        }
+      }, 650);
+    }
+
+    draw();
+    requestAnimationFrame(step);
+  }
+
+  function ghostMove() {
+    // Decide best direction among 4 based on distance to player
+    const options = [
+      {x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}
+    ];
+
+    // Avoid oscillation by biasing continuing direction
+    // We'll infer current ghost dir from last frame movement
+    if (!ghost._vx) { ghost._vx = 0; ghost._vy = 0; }
+
+    const gx = ghost.px, gy = ghost.py;
+
+    const candidates = [];
+    for (const d of options) {
+      const stepX = d.x * ghost.speed;
+      const stepY = d.y * ghost.speed;
+
+      // collision check using ghost radius
+      const r = ghost.radius;
+      const nx = gx + stepX;
+      const ny = gy + stepY;
+      const pts = [
+        [nx + r, ny],
+        [nx - r, ny],
+        [nx, ny + r],
+        [nx, ny - r],
+      ];
+      let ok = true;
+      for (const [sx, sy] of pts) {
+        const tx = Math.floor(sx / TILE);
+        const ty = Math.floor(sy / TILE);
+        if (isWallTile(tx, ty)) { ok=false; break; }
+      }
+      if (!ok) continue;
+
+      const dd = (nx - player.px)**2 + (ny - player.py)**2;
+
+      // Penalize reversing direction a bit
+      const reverse = (d.x === -Math.sign(ghost._vx) && d.y === -Math.sign(ghost._vy));
+      const penalty = reverse ? 1200 : 0;
+
+      candidates.push({d, score: dd + penalty});
+    }
+
+    if (candidates.length === 0) return;
+
+    candidates.sort((a,b)=>a.score-b.score);
+    const best = candidates[0].d;
+
+    ghost._vx = best.x * ghost.speed;
+    ghost._vy = best.y * ghost.speed;
+
+    ghost.px += ghost._vx;
+    ghost.py += ghost._vy;
+  }
+
+  // ===== Drawing =====
+  function draw() {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // Background grid subtle
+    ctx.globalAlpha = 0.25;
+    ctx.strokeStyle = "#1a2554";
+    for (let x=0;x<=COLS;x++){
+      ctx.beginPath();
+      ctx.moveTo(x*TILE, 0);
+      ctx.lineTo(x*TILE, canvas.height);
+      ctx.stroke();
+    }
+    for (let y=0;y<=ROWS;y++){
+      ctx.beginPath();
+      ctx.moveTo(0, y*TILE);
+      ctx.lineTo(canvas.width, y*TILE);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // Walls
+    for (let y=0;y<ROWS;y++){
+      for (let x=0;x<COLS;x++){
+        if (map[y][x] === 1) {
+          ctx.fillStyle = "#1b2a66";
+          ctx.fillRect(x*TILE, y*TILE, TILE, TILE);
+          ctx.strokeStyle = "#2d46a3";
+          ctx.strokeRect(x*TILE+0.5, y*TILE+0.5, TILE-1, TILE-1);
+        } else if (map[y][x] === 2) {
+          // Dot
+          ctx.fillStyle = "#ffeaa7";
+          ctx.beginPath();
+          ctx.arc(x*TILE + TILE/2, y*TILE + TILE/2, 3.2, 0, Math.PI*2);
+          ctx.fill();
+        }
+      }
+    }
+
+    // Player (Pacman)
+    const angle = Math.atan2(dir.y, dir.x) || 0;
+    const mouthOpen = 0.20 + 0.55*player.mouth; // radians portion
+    const startA = angle + mouthOpen;
+    const endA   = angle + (Math.PI*2 - mouthOpen);
+
+    ctx.fillStyle = "#ffd43b";
+    ctx.beginPath();
+    ctx.moveTo(player.px, player.py);
+    ctx.arc(player.px, player.py, player.radius, startA, endA, false);
+    ctx.closePath();
+    ctx.fill();
+
+    // Eye
+    ctx.fillStyle = "#1a1a1a";
+    const ex = player.px + Math.cos(angle - 0.9) * (player.radius*0.35);
+    const ey = player.py + Math.sin(angle - 0.9) * (player.radius*0.35);
+    ctx.beginPath();
+    ctx.arc(ex, ey, 2.5, 0, Math.PI*2);
+    ctx.fill();
+
+    // Ghost
+    drawGhost(ghost.px, ghost.py, ghost.radius, ghost.color);
+
+    // Status overlay
+    if (!running) {
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      ctx.fillStyle = "#e8ecff";
+      ctx.textAlign = "center";
+      ctx.font = "bold 28px system-ui, sans-serif";
+      const msg = (status==="READY") ? "PRESS Start" : (status==="WIN") ? "YOU WIN!" : (status==="LOSE") ? "OOPS!" : "PAUSED";
+      ctx.fillText(msg, canvas.width/2, canvas.height/2 - 10);
+
+      ctx.font = "14px system-ui, sans-serif";
+      ctx.fillStyle = "rgba(232,236,255,0.85)";
+      ctx.fillText("矢印キー / WASD で移動", canvas.width/2, canvas.height/2 + 18);
+    }
+  }
+
+  function drawGhost(x,y,r,color){
+    ctx.fillStyle = color;
+
+    // Body
+    ctx.beginPath();
+    ctx.arc(x, y, r, Math.PI, 0, false);
+    ctx.lineTo(x + r, y + r);
+    // wavy bottom
+    const bumps = 5;
+    for (let i=0;i<bumps;i++){
+      const bx = x + r - (i*(2*r/bumps));
+      const by = y + r - (i%2===0 ? 6 : 0);
+      ctx.lineTo(bx, by);
+    }
+    ctx.lineTo(x - r, y + r);
+    ctx.closePath();
+    ctx.fill();
+
+    // Eyes
+    ctx.fillStyle="#ffffff";
+    ctx.beginPath();
+    ctx.arc(x - r*0.35, y - r*0.1, r*0.23, 0, Math.PI*2);
+    ctx.arc(x + r*0.35, y - r*0.1, r*0.23, 0, Math.PI*2);
+    ctx.fill();
+
+    // Pupils (look at player)
+    const vx = Math.sign(player.px - x);
+    const vy = Math.sign(player.py - y);
+    ctx.fillStyle="#1a1a1a";
+    ctx.beginPath();
+    ctx.arc(x - r*0.35 + vx*3, y - r*0.1 + vy*2, r*0.10, 0, Math.PI*2);
+    ctx.arc(x + r*0.35 + vx*3, y - r*0.1 + vy*2, r*0.10, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // ===== Controls =====
+  btnStart.addEventListener("click", () => {
+    ensureAudio(); // must be user gesture
+    if (status === "WIN") { restart(); }
+    if (status === "READY" || status === "PAUSED") {
+      status = "RUNNING";
+      statusEl.textContent = status;
+      running = true;
+      requestAnimationFrame(step);
+    } else if (status === "RUNNING") {
+      status = "PAUSED";
+      statusEl.textContent = status;
+      running = false;
+      draw();
+    } else if (status === "LOSE") {
+      restart();
+      status = "RUNNING";
+      statusEl.textContent = status;
+      running = true;
+      requestAnimationFrame(step);
+    }
+  });
+
+  btnRestart.addEventListener("click", () => {
+    ensureAudio();
+    restart();
+  });
+
+  btnMute.addEventListener("click", () => {
+    ensureAudio();
+    muted = !muted;
+    btnMute.textContent = `Sound: ${muted ? "OFF" : "ON"}`;
+    if (!muted) beep({freq:660,dur:0.06,type:"triangle",gain:0.05});
+  });
+
+  // Initial
+  genMap();
+  resetEntities();
+  draw();
+})();
+</script>
+</body>
+</html>
